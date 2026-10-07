@@ -4,7 +4,7 @@ Telegram bot that turns a list of tracks into one DJ-style mix. Built to run on 
 
 ## Setup
 
-Create `.env` next to `docker-compose.yml`:
+Copy `.env.example` to `.env` next to `docker-compose.yml` and fill it in:
 
 ```
 BOT_TOKEN=123456789:AAH...
