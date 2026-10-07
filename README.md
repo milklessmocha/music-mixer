@@ -43,9 +43,9 @@ The mix and all downloaded files are deleted once the mix is sent.
 
 ## How a transition works (`mixer.py`)
 
-- Tempo and a beat grid are estimated for each part (spectral-flux onsets, autocorrelation, line fit through the onset peaks).
-- The incoming part is time-stretched with ffmpeg `atempo` to the running mix tempo, if that takes no more than 8%.
-- The overlap is shifted so the incoming first beat lands on an outgoing beat.
+- Tempo and a beat grid are measured on 15 s of each track around the transition: the outgoing track at `end - fade`, the incoming one at `beginning + fade`.
+- During the overlap both tracks follow one beat grid whose tempo ramps from the outgoing BPM to the incoming BPM (time-stretch with pitch kept). Outside overlaps every track plays at its own tempo, so the overlap lasts exactly `fade` only when both BPMs are equal.
+- The overlap starts on an outgoing beat, and the incoming track starts on its first beat.
 - During the overlap, mids/highs crossfade with an equal-power curve while the bass (below 200 Hz) swaps over one beat at the midpoint, so two kick drums never play at once.
 
 Tuning knobs are at the top of `mixer.py`.
@@ -54,7 +54,7 @@ Tuning knobs are at the top of `mixer.py`.
 
 - Telegram bots can only download files up to 20 MB and upload up to 50 MB (about 35 min at 192 kbps). Send a link for larger files.
 - Beats are aligned, bars and phrases are not (no downbeat detection).
-- Once locked, the mix stays at the first track's tempo unless a track is more than 8% away.
+- Tempo is assumed steady within the 15 s measuring window.
 - One mix renders at a time; sessions live in memory and are lost on restart.
 
 ## Test

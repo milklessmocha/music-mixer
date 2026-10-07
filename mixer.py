@@ -3,12 +3,12 @@ import math
 import subprocess
 
 import numpy as np
-from scipy.signal import butter, sosfiltfilt, stft
+from scipy.signal import butter, correlate, sosfiltfilt, stft
 
 SR = 44100
 ANALYSIS_SR = 22050
 HOP = 512             # analysis frame step, ~23 ms
-MAX_STRETCH = 0.08     # beyond +/-8% tempo change the stretch sounds bad, so mix without locking
+BPM_WINDOW = 15        # seconds of audio used to measure tempo around a transition point
 CROSSOVER_HZ = 200     # bass/rest split point for the EQ swap
 BITRATE = "192k"       # ~1.4 MB/min, keeps a 30 min mix under Telegram's 50 MB bot upload cap
 
@@ -58,10 +58,49 @@ def analyze(path, start, end):
     return bpm, beats
 
 
-def stretch_ratio(bpm, target):
-    """atempo ratio that puts bpm on target, allowing half/double-time readings. 1.0 if too far off."""
-    r = min((target / (bpm * k) for k in (0.5, 1, 2)), key=lambda r: abs(math.log(r)))
-    return r if abs(r - 1) <= MAX_STRETCH else 1.0
+def match_octave(bpm, target):
+    """bpm, halved or doubled if that reads closer to target (beat trackers often land on half/double time)."""
+    return min((bpm * k for k in (0.5, 1, 2)), key=lambda b: abs(math.log(target / b)))
+
+
+def local_tempo(path, start, end, center):
+    """(bpm, beat times in absolute seconds) measured on a BPM_WINDOW slice of [start, end] around center."""
+    ws = max(start, min(center - BPM_WINDOW / 2, end - BPM_WINDOW))
+    we = min(end, ws + BPM_WINDOW)
+    bpm, beats = analyze(path, ws, we)
+    return bpm, ws + beats
+
+
+def ramp(audio, from_bpm, to_bpm, own_bpm, seconds, frame=2048, tol=256):
+    """WSOLA time-stretch (pitch kept): over `seconds` of output, play `audio` at a tempo going linearly
+    from_bpm -> to_bpm, where own_bpm is the audio's native tempo. Returns exactly seconds * SR samples."""
+    hop = frame // 2
+    n_out = int(seconds * SR)
+    starts = np.arange(-hop, n_out, hop)  # output start of each frame
+    centre = (starts + hop) / SR
+    tau = np.minimum(centre, seconds)
+    # input time reached at output time tau: integral of ramp_bpm / own_bpm, then steady at to_bpm
+    x = (from_bpm * tau + (to_bpm - from_bpm) * tau ** 2 / (2 * seconds) + (centre - tau) * to_bpm) / own_bpm
+    pos = np.round(x * SR).astype(int) - hop  # input start of each frame
+    pad = frame + tol
+    src = np.pad(audio, ((pad, 2 * pad), (0, 0)))
+    mono = src.mean(axis=1)
+    win = np.hanning(frame + 2)[1:-1].astype(np.float32)  # no zero ends, so the edges normalize cleanly
+    out = np.zeros((n_out + 2 * frame, 2), np.float32)
+    wsum = np.zeros(n_out + 2 * frame, np.float32)
+    prev = None
+    for o, p in zip(starts + frame, pos + pad):
+        # free search in the middle; the edges stay exact so the joins with untouched audio are seamless
+        if prev is not None and frame <= o - frame and o + frame <= n_out:
+            ref = mono[prev + hop:prev + hop + frame]
+            seg = mono[p - tol:p + tol + frame]
+            energy = np.convolve(seg ** 2, np.ones(frame), mode="valid")  # normalize so loud spots don't win
+            score = correlate(seg, ref, mode="valid", method="fft") / np.sqrt(energy + 1e-9)
+            p += int(np.argmax(score)) - tol
+        out[o:o + frame] += win[:, None] * src[p:p + frame]
+        wsum[o:o + frame] += win
+        prev = p
+    return (out / np.maximum(wsum, 1e-6)[:, None])[frame:frame + n_out]
 
 
 def crossfade(a, b, beat_sec):
@@ -85,42 +124,41 @@ def normalize(x, rms=0.1):
 
 
 def render(segments, out_path, progress=print):
-    """segments: list of (path, start_sec, end_sec, fade_sec). A segment's fade is its outgoing overlap
-    with the next one (or its fade-out to silence if last). Writes an MP3 to out_path."""
-    done, cur, cur_beats, cur_fade, target = [], None, None, None, None
-    for i, (path, start, end, fade) in enumerate(segments, 1):
-        progress(f"Analyzing beats {i}/{len(segments)}...")
-        bpm, beats = analyze(path, start, end)
-        if target is None:
-            r, target = 1.0, bpm
-        else:
-            r = stretch_ratio(bpm, target)
-            target = target if r != 1.0 else bpm
-        b = normalize(decode(path, start, end, tempo=r))
-        b_beats = beats / r
-        if cur is None:
-            cur, cur_beats, cur_fade = b, b_beats, fade / r
-            continue
+    """segments: list of (path, start_sec, end_sec, fade_sec). A segment's fade is its outgoing overlap with the
+    next one (or its fade-out to silence if last). In an overlap both tracks follow one beat grid whose tempo
+    ramps from the outgoing track's BPM to the incoming one's. Elsewhere every track plays at native tempo."""
+    path, start, end, fade = segments[0]
+    progress(f"Loading track 1/{len(segments)}...")
+    done, cur, cur_head = [], normalize(decode(path, start, end)), 0.0  # cur_head: mixed seconds at cur's start
+    for i, (n_path, n_start, n_end, n_fade) in enumerate(segments[1:], 2):
+        progress(f"Analyzing transition {i - 1} -> {i}...")
+        c, c_beats = local_tempo(path, start, end, end - fade)
+        n, n_beats = local_tempo(n_path, n_start, n_end, n_start + fade)
+        n_eff = match_octave(n, c)
+        b = normalize(decode(n_path, n_start, n_end))
+        b_len = len(b) / SR
 
-        cur_len, b_len = len(cur) / SR, len(b) / SR
-        overlap = min(cur_fade, cur_len / 2, b_len / 2)
-        note = f", fade shortened to {overlap:.1f} s to fit" if overlap < cur_fade - 0.05 else ""
-        progress(f"Rendering transition {i - 1} -> {i} ({bpm:.0f} -> {target:.0f} BPM{note})...")
-        s = cur_len - overlap
-        if len(cur_beats) and len(b_beats):
-            # land b's first beat on the nearest outgoing beat
-            nearest = cur_beats[np.argmin(np.abs(cur_beats - (s + b_beats[0])))]
-            s = nearest - b_beats[0]
-        # keep transitions from colliding with the previous one or running past b's midpoint
-        s = min(max(s, cur_len / 2, cur_len - b_len / 2), cur_len - 0.05)
-        cut = int(s * SR)
-        n = len(cur) - cut
+        # outgoing: overlap starts on the cur beat nearest end - fade
+        overlap_start = c_beats[np.argmin(np.abs(c_beats - (end - fade)))]
+        L = min(end - overlap_start, len(cur) / SR - cur_head)
+        # incoming: start on its first beat (extend the local grid back to n_start)
+        period = 60 / n
+        offset = max(0.0, (n_beats[0] - n_start + period / 4) % period - period / 4)  # a beat just before n_start counts
+        L = min(L, (b_len / 2 - offset) * n_eff / c)  # incoming overlap must fit in half its part
+        note = f", fade shortened to {L:.1f} s" if L < fade - 60 / c else ""
+        progress(f"Transition {i - 1} -> {i}: {c:.1f} -> {n_eff:.1f} BPM{note}")
+        T = 2 * c * L / (c + n_eff)  # overlap length in the mix
+        L_n = L * c / n_eff          # seconds of the incoming track used during the overlap
+
+        cut = len(cur) - int(L * SR)
+        a_part = ramp(cur[cut:], c, n_eff, c, T)
+        b_part = ramp(b[int(offset * SR):int((offset + L_n) * SR)], c, n_eff, n_eff, T)
         done.append(cur[:cut])
-        cur = np.concatenate([crossfade(cur[cut:], b[:n], 60 / target), b[n:]])
-        cur_beats, cur_fade = b_beats, fade / r
+        cur = np.concatenate([crossfade(a_part, b_part, 120 / (c + n_eff)), b[int((offset + L_n) * SR):]])
+        path, start, end, fade, cur_head = n_path, n_start, n_end, n_fade, T
 
-    n = min(int(cur_fade * SR), len(cur))  # last track fades out to silence
-    cur[-n:] *= np.cos(np.linspace(0, np.pi / 2, n, dtype=np.float32))[:, None]
+    tail = min(int(fade * SR), len(cur))  # last track fades out to silence
+    cur[-tail:] *= np.cos(np.linspace(0, np.pi / 2, tail, dtype=np.float32))[:, None]
     done.append(cur)
     mix = np.concatenate(done)
     mix /= max(1.0, float(np.abs(mix).max()))  # ponytail: peak normalize, swap for a limiter if quiet mixes bother you

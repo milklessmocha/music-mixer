@@ -47,9 +47,26 @@ assert default_fade(130, 200) == 7
 assert default_fade(200) == 10
 
 # tempo
-assert abs(mixer.stretch_ratio(124, 120) - 120 / 124) < 1e-9
-assert mixer.stretch_ratio(240, 120) == 1.0  # half-time reading, already locked
-assert mixer.stretch_ratio(150, 120) == 1.0  # too far, don't stretch
+assert mixer.match_octave(124, 120) == 124
+assert mixer.match_octave(62, 120) == 124   # half-time reading
+assert mixer.match_octave(250, 120) == 125  # double-time reading
+
+# ramp: 120 -> 128 BPM over the overlap, every click lands where the ramp math puts it
+SR = mixer.SR
+a = np.random.default_rng(0).normal(0, 0.01, (SR * 8, 2)).astype(np.float32)
+for k in range(16):
+    a[int(k * 0.5 * SR):int(k * 0.5 * SR) + 200] = 1
+T = 2 * 120 * 8 / (120 + 128)
+y = mixer.ramp(a, 120, 128, 120, T)
+assert len(y) == int(T * SR)
+hot = np.abs(y[:, 0]) > 0.5
+clicks = np.flatnonzero(hot[1:] & ~hot[:-1]) / SR
+clicks = clicks[np.r_[True, np.diff(clicks) > 0.2]]
+acc = 8 / (2 * T)  # input beat k*0.5 s is reached at the root of 120 t + acc t^2 = 60 k
+predicted = (-120 + np.sqrt(120 ** 2 + 4 * acc * 60 * np.arange(16))) / (2 * acc)
+assert max(np.abs(predicted - t).min() for t in clicks) < 0.008
+assert np.diff(clicks)[0] > 0.49 and np.diff(clicks)[-1] < 0.48  # spacing shrinks from 0.500 toward 0.469
+assert np.abs(mixer.ramp(a, 120, 120, 120, 8.0) - a).max() < 1e-6  # steady tempo is an exact copy
 
 # crossfade starts as pure outgoing and ends as pure incoming
 rng = np.random.default_rng(1)
@@ -61,16 +78,19 @@ assert np.allclose(x[0], a[0], atol=1e-4) and np.allclose(x[-1], b[-1], atol=1e-
 with tempfile.TemporaryDirectory() as d:
     d = Path(d)
     click_track(d / "a.wav", 120)
-    click_track(d / "b.wav", 124)
+    click_track(d / "b.wav", 128)
     assert abs(probe_duration(d / "a.wav") - 30) < 0.1
-    for name, bpm in [("a.wav", 120), ("b.wav", 124)]:
+    for name, bpm in [("a.wav", 120), ("b.wav", 128)]:
         found, beats = mixer.analyze(d / name, 0, 30)
         assert abs(found - bpm) < 0.5, (name, found)
         assert np.abs(beats - np.round(beats * bpm / 60) * 60 / bpm).max() < 0.03, name  # grid sits on the clicks
     fade = 8
-    seconds = mixer.render([(d / "a.wav", 0, 30, fade), (d / "b.wav", 2, 30, 5)], d / "mix.mp3", progress=lambda s: None)
-    expected = 30 + 28 * 124 / 120 - fade  # b is slowed to 120 BPM
-    assert abs(seconds - expected) < 1.0, (seconds, expected)
+    seconds = mixer.render([(d / "a.wav", 0, 30, fade), (d / "b.wav", 0, 30, 5)], d / "mix.mp3", progress=lambda s: None)
+    # a plays 22 s, then the 8 s overlap ramps 120 -> 128 BPM and takes T, then b's remaining 30 - 7.5 s
+    expected = 22 + T + 30 - 8 * 120 / 128
+    assert abs(seconds - expected) < 0.3, (seconds, expected)
     assert abs(probe_duration(d / "mix.mp3") - seconds) < 0.2
+    assert abs(mixer.analyze(d / "mix.mp3", 2, 20)[0] - 120) < 0.5   # before the overlap: a's tempo
+    assert abs(mixer.analyze(d / "mix.mp3", 32, 50)[0] - 128) < 0.5  # after it: b's tempo
 
 print("ok")
