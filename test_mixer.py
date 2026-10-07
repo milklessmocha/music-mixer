@@ -194,4 +194,21 @@ async def idle_timeout():
 
 
 asyncio.run(idle_timeout())
+
+
+# /download: the link becomes the whole track, the same as /mix + "start - end" + /done
+async def download_flow():
+    with tempfile.TemporaryDirectory() as d:
+        click_track(Path(d) / "a.wav", 120)
+        state = FSMContext(MemoryStorage(), StorageKey(bot_id=1, chat_id=1, user_id=1))
+        await state.set_data({"dir": d, "tracks": [], "pending": None, "single": True})
+        chat = FakeChat()
+        await bot.accept_audio(chat, state, Path(d) / "a.wav")
+        track = (await state.get_data())["tracks"][0]
+        assert (track["begin"], track["fade"]) == (0, None) and abs(track["end"] - 30) < 0.1
+        assert track["end"] == parse_period("start - end", track["duration"])[1]
+        assert await state.get_state() == bot.MixFlow.waiting_name
+
+
+asyncio.run(download_flow())
 print("ok")

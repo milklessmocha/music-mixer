@@ -1,4 +1,5 @@
-"""Telegram front end: /mix -> audio -> time period -> ... -> /done -> name -> formats -> files."""
+"""Telegram front end: /mix -> audio -> time period -> ... -> /done -> name -> formats -> files.
+/download is a one-track /mix of the whole track: link -> name -> formats -> files."""
 import asyncio
 import contextlib
 import json
@@ -177,7 +178,9 @@ dp.callback_query.outer_middleware(session_timer)
 @dp.message(Command("start", "help"))
 async def cmd_start(msg: Message):
     await msg.answer("Send /mix to start a mix. Then send audios or links one by one (6 s to 10 min each), "
-                     "give each a time period, and send /done to render. /cancel drops the session.")
+                     "give each a time period, and send /done to render.\n"
+                     "Send /download to get one whole track from a link in the format you pick.\n"
+                     "/cancel drops the session.")
 
 
 @dp.message(Command("mix"))
@@ -186,6 +189,15 @@ async def cmd_mix(msg: Message, state: FSMContext):
     await state.set_state(MixFlow.waiting_audio)
     await state.update_data(dir=tempfile.mkdtemp(prefix="mix-"), tracks=[], pending=None)
     await msg.answer("Send the first audio file or link (6 s to 10 min).")
+
+
+@dp.message(Command("download"))
+async def cmd_download(msg: Message, state: FSMContext):
+    """Same as /mix with one link, period 'start - end', then /done."""
+    await drop_session(state)
+    await state.set_state(MixFlow.waiting_audio)
+    await state.update_data(dir=tempfile.mkdtemp(prefix="mix-"), tracks=[], pending=None, single=True)
+    await msg.answer("Send the link (6 s to 10 min).")
 
 
 @dp.message(Command("cancel"))
@@ -275,6 +287,11 @@ async def accept_audio(msg, state, path):
     if not MIN_SEC <= duration <= MAX_SEC:
         path.unlink(missing_ok=True)
         return await msg.answer(f"That audio is {fmt(duration)}. It must be between 00:06 and 10:00. Send another one.")
+    if (await state.get_data()).get("single"):  # /download: whole track, straight to naming
+        track = {"path": str(path), "duration": duration, "begin": 0, "end": duration, "fade": None}
+        await state.update_data(tracks=[track])
+        await state.set_state(MixFlow.waiting_name)
+        return await msg.answer(f"Got it, length {fmt(duration)}.\nSend a name for the file, without extension.")
     await state.update_data(pending={"path": str(path), "duration": duration})
     await state.set_state(MixFlow.waiting_period)
     await msg.answer(f"Got it, length {fmt(duration)}.\n{PERIOD_HELP}")

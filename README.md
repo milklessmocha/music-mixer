@@ -43,6 +43,8 @@ set -a && source .env && set +a && .venv/bin/python bot.py
 
 `/cancel` drops the session at any step.
 
+`/download` does the same for a single whole track: send a link, a name, then pick formats. The result is identical to `/mix` with that link, `start - end` and `/done`.
+
 The mix and all downloaded files are deleted once the mix is sent.
 
 ## How a transition works (`mixer.py`)
