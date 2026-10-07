@@ -1,0 +1,10 @@
+.git
+.gitignore
+.idea
+.venv
+__pycache__
+*.pyc
+.env
+LICENSE
+README.md
+test_mixer.py

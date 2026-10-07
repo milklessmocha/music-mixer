@@ -1,0 +1,23 @@
+services:
+  mixer-bot:
+    build: .
+    image: music-mixer:latest
+    container_name: music-mixer
+    restart: unless-stopped
+    init: true
+
+    env_file:
+      - .env
+
+    # Downloads and the rendered mix live in the container's /tmp and are deleted
+    # after each mix, so there is nothing to persist: no volumes.
+    # The bot talks to Telegram over long polling: no ports to publish.
+
+    # A 30 min mix holds ~600 MB of float audio plus working copies.
+    mem_limit: 3g
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
