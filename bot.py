@@ -25,6 +25,7 @@ MIN_FADE = 3
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # Bot API getFile cap
 URL_DOWNLOAD_LIMIT = 100 * 1024 * 1024
 TG_UPLOAD_LIMIT = 50 * 1024 * 1024  # Bot API sendDocument/sendAudio cap
+SESSION_TIMEOUT = 600  # seconds without any action before a /mix session and its files are dropped
 PLAYABLE = {"mp3", "m4a"}  # Telegram's audio player takes these; the rest go out as files
 
 PERIOD_HELP = ("Send the part to use as  beginning - end  or  beginning - end - fade\n"
@@ -34,6 +35,7 @@ PERIOD_HELP = ("Send the part to use as  beginning - end  or  beginning - end - 
 
 dp = Dispatcher()
 render_lock = asyncio.Lock()  # ponytail: one render at a time keeps the Pi responsive; a real queue if users pile up
+timers = {}  # (chat id, user id) -> task that drops the session after SESSION_TIMEOUT idle seconds
 
 
 class MixFlow(StatesGroup):
@@ -145,6 +147,31 @@ async def drop_session(state):
     if folder:
         shutil.rmtree(folder, ignore_errors=True)
     await state.clear()
+
+
+async def expire(state, bot, chat_id):
+    await asyncio.sleep(SESSION_TIMEOUT)
+    await drop_session(state)
+    await bot.send_message(chat_id, "The mix session expired after 10 minutes without activity and its files "
+                                    "were deleted. Send /mix to start again.")
+
+
+async def session_timer(handler, event, data):
+    """Every message or button press restarts the idle timer of an open session."""
+    if "event_chat" not in data or "state" not in data:  # no chat means no session to time
+        return await handler(event, data)
+    key = (data["event_chat"].id, data["event_from_user"].id)
+    if task := timers.pop(key, None):
+        task.cancel()
+    try:
+        return await handler(event, data)
+    finally:
+        if await data["state"].get_state() is not None:
+            timers[key] = asyncio.create_task(expire(data["state"], data["bot"], key[0]))
+
+
+dp.message.outer_middleware(session_timer)
+dp.callback_query.outer_middleware(session_timer)
 
 
 @dp.message(Command("start", "help"))

@@ -167,4 +167,31 @@ async def finish_twice():
 
 asyncio.run(finish_twice())
 
+
+# idle sessions expire; any action restarts the clock
+async def idle_timeout():
+    with tempfile.TemporaryDirectory() as d:
+        session = Path(d) / "session"
+        session.mkdir()
+        state = FSMContext(MemoryStorage(), StorageKey(bot_id=1, chat_id=1, user_id=1))
+        chat = FakeChat()
+        chat.send_message = lambda chat_id, text: chat.answer(text)
+        data = {"event_chat": chat.chat, "event_from_user": chat.chat, "state": state, "bot": chat}
+
+        async def start_mix(event, data):
+            await state.set_state(bot.MixFlow.waiting_audio)
+            await state.set_data({"dir": str(session)})
+
+        bot.SESSION_TIMEOUT = 0.3
+        await bot.session_timer(start_mix, None, data)
+        await asyncio.sleep(0.2)
+        await bot.session_timer(lambda e, d: asyncio.sleep(0), None, data)  # activity at 0.2 s restarts the clock
+        await asyncio.sleep(0.2)
+        assert await state.get_state() is not None and session.exists()  # 0.4 s total, but only 0.2 s idle
+        await asyncio.sleep(0.2)
+        assert await state.get_state() is None and not session.exists()
+        assert "expired" in chat.texts[-1]
+
+
+asyncio.run(idle_timeout())
 print("ok")
