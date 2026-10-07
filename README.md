@@ -1,6 +1,6 @@
 # music-mixer
 
-Telegram bot that turns a list of tracks into one DJ-style MP3 mix. Built to run on a Raspberry Pi 5.
+Telegram bot that turns a list of tracks into one DJ-style mix. Built to run on a Raspberry Pi 5.
 
 ## Setup
 
@@ -37,7 +37,11 @@ set -a && source .env && set +a && .venv/bin/python bot.py
    - Times are `mm:ss` (`1:2` and `01:02` are the same). `start` and `end` mean the track edges.
    - `fade` is how long this track overlaps the next one (or fades out, if last). At least `00:03`, and it must fit twice into the part.
    - Without a fade: 5% of the shorter of this part and the next one, rounded to whole seconds, at least 3 s.
-4. Repeat 2 and 3, then `/done`. `/cancel` drops the session.
+4. Repeat 2 and 3, then `/done`.
+5. Send a name for the mix, without extension.
+6. Tick the formats you want (mp3, m4a, ogg, flac, wav, or All extensions) and tap Submit. mp3 and m4a arrive as playable audio, the rest as files.
+
+`/cancel` drops the session at any step.
 
 The mix and all downloaded files are deleted once the mix is sent.
 
@@ -52,7 +56,7 @@ Tuning knobs are at the top of `mixer.py`.
 
 ## Limits
 
-- Telegram bots can only download files up to 20 MB and upload up to 50 MB (about 35 min at 192 kbps). Send a link for larger files.
+- Telegram bots can only download files up to 20 MB (send a link for larger ones) and upload up to 50 MB. A format over 50 MB is skipped and reported: about 35 min for mp3/m4a/ogg, 10 min for flac, 5 min for wav.
 - Beats are aligned, bars and phrases are not (no downbeat detection).
 - Tempo is assumed steady within the 15 s measuring window.
 - One mix renders at a time; sessions live in memory and are lost on restart.

@@ -10,7 +10,15 @@ ANALYSIS_SR = 22050
 HOP = 512             # analysis frame step, ~23 ms
 BPM_WINDOW = 15        # seconds of audio used to measure tempo around a transition point
 CROSSOVER_HZ = 200     # bass/rest split point for the EQ swap
-BITRATE = "192k"       # ~1.4 MB/min, keeps a 30 min mix under Telegram's 50 MB bot upload cap
+# output formats: extension -> ffmpeg codec args. Lossy ones stay ~1.2-1.4 MB/min, under Telegram's 50 MB
+# bot upload cap for a 30 min mix; FLAC (~5 MB/min) and WAV (~10 MB/min) only fit short mixes.
+FORMATS = {
+    "mp3": ["-c:a", "libmp3lame", "-b:a", "192k"],
+    "m4a": ["-c:a", "aac", "-b:a", "192k"],
+    "ogg": ["-c:a", "libopus", "-b:a", "160k"],
+    "flac": ["-c:a", "flac"],
+    "wav": ["-c:a", "pcm_s16le"],
+}
 
 
 def decode(path, start, end, sr=SR, channels=2, tempo=1.0):
@@ -123,9 +131,9 @@ def normalize(x, rms=0.1):
     return x * (rms / level if level > 0 else 1.0)  # always a writable copy
 
 
-def render(segments, out_path, progress=print):
+def render(segments, progress=print):
     """segments: list of (path, start_sec, end_sec, fade_sec). A segment's fade is its outgoing overlap with the
-    next one (or its fade-out to silence if last). In an overlap both tracks follow one beat grid whose tempo
+    next one (or its fade-out to silence if last). Returns the mix as float32 stereo at SR. In an overlap both tracks follow one beat grid whose tempo
     ramps from the outgoing track's BPM to the incoming one's. Elsewhere every track plays at native tempo."""
     path, start, end, fade = segments[0]
     progress(f"Loading track 1/{len(segments)}...")
@@ -162,7 +170,10 @@ def render(segments, out_path, progress=print):
     done.append(cur)
     mix = np.concatenate(done)
     mix /= max(1.0, float(np.abs(mix).max()))  # ponytail: peak normalize, swap for a limiter if quiet mixes bother you
-    progress("Encoding MP3...")
+    return mix
+
+
+def encode(mix, out_path):
+    """Write mix to out_path, codec picked by its extension (a FORMATS key)."""
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ac", "2", "-ar", str(SR), "-i", "-",
-                    "-b:a", BITRATE, str(out_path)], input=mix.astype("<f4").tobytes(), check=True)
-    return len(mix) / SR
+                    *FORMATS[out_path.suffix[1:]], str(out_path)], input=mix.astype("<f4").tobytes(), check=True)

@@ -1,12 +1,17 @@
 """Self-check: python test_mixer.py"""
+import asyncio
 import subprocess
 import tempfile
 from pathlib import Path
 
 import numpy as np
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.fsm.storage.memory import MemoryStorage
 
+import bot
 import mixer
-from bot import default_fade, parse_period, probe_duration
+from bot import default_fade, formats_keyboard, parse_name, parse_period, probe_duration
 
 
 def rejects(text, duration=200):
@@ -38,6 +43,24 @@ for bad in ["2:00 - 1:00", "0:10 - 3:21", "0:61 - 1:00", "start - end - 0:02", "
             "0:10 - 0:15", "end - start", "hello", "1:00", "0:10 - 0:30 - 0:05 - 0:01", "90 - 120"]:
     assert rejects(bad), bad
 assert not rejects("0:10 - 0:30 - 0:10")
+
+# mix name
+assert parse_name("  Friday set vol. 2 ") == "Friday set vol. 2"
+assert parse_name("mix v1.10") == "mix v1.10"
+for bad in ["", " ", "x" * 65, "set.mp3", "set.flac", "a/b", "a\\b", "what?", ".hidden"]:
+    try:
+        parse_name(bad)
+        raise AssertionError(bad)
+    except ValueError:
+        pass
+
+# format checklist: one button per format, then All, then Submit
+rows = formats_keyboard({"mp3"}).inline_keyboard
+labels = [b.text for row in rows for b in row]
+assert labels[0] == "✅ mp3" and labels.count("⬜ All extensions") == 1 and labels[-1] == "Submit"
+assert all(b.callback_data.startswith("fmt:") for row in rows for b in row)
+assert "✅ All extensions" in [b.text for row in formats_keyboard(set(mixer.FORMATS)).inline_keyboard for b in row]
+assert "⬜ wav" not in [b.text for row in formats_keyboard(set(), ["mp3", "ogg"]).inline_keyboard for b in row]
 
 # default fade
 assert default_fade(120, 200) == 6
@@ -85,12 +108,63 @@ with tempfile.TemporaryDirectory() as d:
         assert abs(found - bpm) < 0.5, (name, found)
         assert np.abs(beats - np.round(beats * bpm / 60) * 60 / bpm).max() < 0.03, name  # grid sits on the clicks
     fade = 8
-    seconds = mixer.render([(d / "a.wav", 0, 30, fade), (d / "b.wav", 0, 30, 5)], d / "mix.mp3", progress=lambda s: None)
+    mix = mixer.render([(d / "a.wav", 0, 30, fade), (d / "b.wav", 0, 30, 5)], progress=lambda s: None)
+    seconds = len(mix) / SR
+    for ext in mixer.FORMATS:
+        mixer.encode(mix, d / f"mix.{ext}")
+        assert abs(probe_duration(d / f"mix.{ext}") - seconds) < 0.2, ext
     # a plays 22 s, then the 8 s overlap ramps 120 -> 128 BPM and takes T, then b's remaining 30 - 7.5 s
     expected = 22 + T + 30 - 8 * 120 / 128
     assert abs(seconds - expected) < 0.3, (seconds, expected)
-    assert abs(probe_duration(d / "mix.mp3") - seconds) < 0.2
     assert abs(mixer.analyze(d / "mix.mp3", 2, 20)[0] - 120) < 0.5   # before the overlap: a's tempo
     assert abs(mixer.analyze(d / "mix.mp3", 32, 50)[0] - 128) < 0.5  # after it: b's tempo
+
+
+# finish(): a format over the upload limit keeps the session and brings the picker back without it
+class FakeChat:
+    def __init__(self):
+        self.chat, self.texts, self.markups, self.files = type("C", (), {"id": 1}), [], [], []
+
+    async def answer(self, text, reply_markup=None, **_):
+        self.texts.append(text)
+        self.markups.append(reply_markup)
+        return self
+
+    async def edit_text(self, text, **_):
+        self.texts.append(text)
+
+    async def send_audio(self, chat_id, file, **_):
+        self.files.append(file.filename)
+
+    send_document = send_audio
+
+
+async def finish_twice():
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        click_track(d / "a.wav", 120)
+        click_track(d / "b.wav", 128)
+        session = d / "session"
+        session.mkdir()
+        state = FSMContext(MemoryStorage(), StorageKey(bot_id=1, chat_id=1, user_id=1))
+        tracks = [{"path": str(d / "a.wav"), "begin": 0, "end": 30, "fade": 8},
+                  {"path": str(d / "b.wav"), "begin": 0, "end": 30, "fade": None}]
+        await state.set_data({"dir": str(session), "tracks": tracks, "name": "set", "formats": ["mp3", "wav"]})
+        chat = FakeChat()
+        bot.TG_UPLOAD_LIMIT = 3 * 1024 * 1024  # ~52 s mix: mp3 ~1.2 MB fits, wav ~9 MB doesn't
+        await bot.finish(chat, state, chat)
+        assert chat.files == ["set.mp3"], chat.files
+        assert await state.get_state() == bot.MixFlow.choosing_formats
+        assert (await state.get_data())["blocked"] == ["wav"] and session.exists()
+        picker = [b.text for row in chat.markups[-1].inline_keyboard for b in row]
+        assert "⬜ wav" not in picker and "⬜ mp3" in picker
+
+        await state.update_data(formats=["ogg"])
+        await bot.finish(chat, state, chat)
+        assert chat.files == ["set.mp3", "set.ogg"] and chat.texts[-1] == "Done!"
+        assert await state.get_state() is None and not session.exists()
+
+
+asyncio.run(finish_twice())
 
 print("ok")

@@ -1,4 +1,4 @@
-"""Telegram front end: /mix -> audio -> time period -> audio -> ... -> /done -> MP3."""
+"""Telegram front end: /mix -> audio -> time period -> ... -> /done -> name -> formats -> files."""
 import asyncio
 import contextlib
 import json
@@ -16,7 +16,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import mixer
 
@@ -24,6 +24,8 @@ MIN_SEC, MAX_SEC = 6, 600
 MIN_FADE = 3
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # Bot API getFile cap
 URL_DOWNLOAD_LIMIT = 100 * 1024 * 1024
+TG_UPLOAD_LIMIT = 50 * 1024 * 1024  # Bot API sendDocument/sendAudio cap
+PLAYABLE = {"mp3", "m4a"}  # Telegram's audio player takes these; the rest go out as files
 
 PERIOD_HELP = ("Send the part to use as  beginning - end  or  beginning - end - fade\n"
                "Times are mm:ss (1:2 and 01:02 both work). Use start / end for the track edges.\n"
@@ -37,6 +39,8 @@ render_lock = asyncio.Lock()  # ponytail: one render at a time keeps the Pi resp
 class MixFlow(StatesGroup):
     waiting_audio = State()
     waiting_period = State()
+    waiting_name = State()
+    choosing_formats = State()
 
 
 def fmt(sec):
@@ -73,6 +77,30 @@ def parse_period(text, duration):
     if fade is not None and 2 * fade > end - begin:
         raise ValueError(f"Fade must fit twice into the part, so at most {fmt((end - begin) / 2)} here.")
     return begin, end, fade
+
+
+def parse_name(text):
+    """Mix name as typed, without extension. Raises ValueError with a reason."""
+    name = text.strip()
+    if not 1 <= len(name) <= 64:
+        raise ValueError("The name must be 1 to 64 characters.")
+    if re.search(r'[\\/:*?"<>|\x00-\x1f]', name) or name.startswith("."):
+        raise ValueError('The name can\'t start with a dot or contain / \\ : * ? " < > |')
+    if re.search(r"\.[A-Za-z][A-Za-z0-9]{1,3}$", name):
+        raise ValueError("Send the name without an extension, you pick the formats next.")
+    return name
+
+
+def formats_keyboard(selected, available=tuple(mixer.FORMATS)):
+    """Checklist: tap a format to tick or untick it, 'All extensions' toggles every one, Submit renders."""
+    def button(on, label, key):
+        return InlineKeyboardButton(text=("✅ " if on else "⬜ ") + label, callback_data=f"fmt:{key}")
+
+    formats = [button(ext in selected, ext, ext) for ext in available]
+    rows = [formats[i:i + 3] for i in range(0, len(formats), 3)]
+    rows.append([button(set(selected) == set(available), "All extensions", "all")])
+    rows.append([InlineKeyboardButton(text="Submit", callback_data="fmt:go")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def default_fade(cur_len, next_len=None):
@@ -140,8 +168,49 @@ async def cmd_cancel(msg: Message, state: FSMContext):
 
 
 @dp.message(Command("done"), MixFlow.waiting_audio)
-async def cmd_done(msg: Message, state: FSMContext, bot: Bot):
-    await finish(msg, state, bot)
+async def cmd_done(msg: Message, state: FSMContext):
+    if not (await state.get_data())["tracks"]:
+        return await msg.answer("Send at least one audio first.")
+    await state.set_state(MixFlow.waiting_name)
+    await msg.answer("Send a name for the mix, without extension.")
+
+
+@dp.message(MixFlow.waiting_name, F.text)
+async def got_name(msg: Message, state: FSMContext):
+    try:
+        name = parse_name(msg.text)
+    except ValueError as e:
+        return await msg.answer(f"{e} Send another name.")
+    await state.update_data(name=name, formats=[])
+    await state.set_state(MixFlow.choosing_formats)
+    await msg.answer(f"Name: {name}\nPick the formats you want, then Submit.", reply_markup=formats_keyboard([]))
+
+
+@dp.callback_query(MixFlow.choosing_formats, F.data.startswith("fmt:"))
+async def got_format(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    selected, key = set(data["formats"]), cb.data[4:]
+    available = [ext for ext in mixer.FORMATS if ext not in data.get("blocked", [])]
+    if key == "go":
+        if not selected:
+            return await cb.answer("Pick at least one format.", show_alert=True)
+        await cb.answer()
+        chosen = [ext for ext in mixer.FORMATS if ext in selected]
+        await cb.message.edit_text(f"Name: {data['name']}\nFormats: {', '.join(chosen)}")
+        return await finish(cb.message, state, bot)
+    if key == "all":
+        selected = set() if selected == set(available) else set(available)
+    elif key in available:
+        selected ^= {key}
+    await state.update_data(formats=sorted(selected))
+    await cb.answer()
+    with contextlib.suppress(TelegramBadRequest):
+        await cb.message.edit_reply_markup(reply_markup=formats_keyboard(selected, available))
+
+
+@dp.callback_query(F.data.startswith("fmt:"))
+async def stale_format(cb: CallbackQuery):
+    await cb.answer("This menu has expired. Send /mix to start a new mix.", show_alert=True)
 
 
 @dp.message(MixFlow.waiting_audio, F.audio | F.voice | F.document)
@@ -200,11 +269,11 @@ async def got_period(msg: Message, state: FSMContext):
 
 
 async def finish(msg, state, bot):
-    """Render and send the session's mix. Kept separate so a future inline 'Render mix' button can call it."""
+    """Render the session's mix once, encode it to each chosen format and send the files.
+    If anything wasn't delivered, the session is kept and the picker comes back without the too-big formats."""
     data = await state.get_data()
-    tracks = data["tracks"]
-    if not tracks:
-        return await msg.answer("Send at least one audio first.")
+    tracks, name = data["tracks"], data["name"]
+    formats = [ext for ext in mixer.FORMATS if ext in data["formats"]]
     await state.clear()
     lens = [t["end"] - t["begin"] for t in tracks]
     segments = [(t["path"], t["begin"], t["end"],
@@ -214,19 +283,52 @@ async def finish(msg, state, bot):
     status = await msg.answer("Waiting for another mix to finish..." if render_lock.locked() else "Starting...")
     loop = asyncio.get_running_loop()
     progress = lambda text: asyncio.run_coroutine_threadsafe(edit(status, text), loop)
+    too_big, failed = {}, None
     try:
         async with render_lock:
-            out = Path(data["dir"]) / "mix.mp3"
-            seconds = await asyncio.to_thread(mixer.render, segments, out, progress)
-            await edit(status, "Sending...")
-            await bot.send_audio(msg.chat.id, FSInputFile(out, filename="mix.mp3"), title="DJ mix",
-                                 duration=int(seconds), request_timeout=600)
-        await edit(status, "Done!")
+            mix = await asyncio.to_thread(mixer.render, segments, progress)
+            for ext in formats:
+                out = Path(data["dir"]) / f"mix.{ext}"
+                await edit(status, f"Encoding {ext}...")
+                await asyncio.to_thread(mixer.encode, mix, out)
+                size = out.stat().st_size
+                if size > TG_UPLOAD_LIMIT:
+                    too_big[ext] = size
+                    continue
+                await edit(status, f"Sending {ext}...")
+                file = FSInputFile(out, filename=f"{name}.{ext}")
+                if ext in PLAYABLE:
+                    await bot.send_audio(msg.chat.id, file, title=name, duration=int(len(mix) / mixer.SR),
+                                         request_timeout=600)
+                else:
+                    await bot.send_document(msg.chat.id, file, request_timeout=600)
+                out.unlink()  # sent, so drop it now rather than holding every format until the end
     except Exception as e:
         logging.exception("mix failed")
-        await edit(status, f"Mix failed: {e}\nSend /mix to try again.")
-    finally:
-        shutil.rmtree(data["dir"], ignore_errors=True)  # downloads and the sent MP3
+        failed = e
+
+    problems = []
+    if too_big:
+        problems.append("Skipped, over Telegram's 50 MB limit: "
+                        + ", ".join(f"{ext} ({size / 1024 / 1024:.0f} MB)" for ext, size in too_big.items()))
+    if failed:
+        problems.append(f"Failed: {failed}")
+    if not problems:
+        shutil.rmtree(data["dir"], ignore_errors=True)  # downloads; sent files are already gone
+        return await edit(status, "Done!")
+
+    blocked = sorted(set(data.get("blocked", [])) | set(too_big))
+    available = [ext for ext in mixer.FORMATS if ext not in blocked]
+    await edit(status, "\n".join(problems))
+    # keep the session for another pick, unless every format is too big or a new /mix already replaced it
+    if available and await state.get_state() is None:
+        await state.set_state(MixFlow.choosing_formats)
+        await state.set_data({**data, "formats": [], "blocked": blocked})
+        await msg.answer(f"Name: {name}\nPick other formats, then Submit. /cancel drops the mix.",
+                         reply_markup=formats_keyboard([], available))
+    else:
+        shutil.rmtree(data["dir"], ignore_errors=True)
+        await msg.answer("Send /mix to start again.")
 
 
 @dp.message(MixFlow.waiting_audio)
@@ -239,6 +341,16 @@ async def expect_period(msg: Message):
     await msg.answer(PERIOD_HELP)
 
 
+@dp.message(MixFlow.waiting_name)
+async def expect_name(msg: Message):
+    await msg.answer("Send a name for the mix as text, without extension.")
+
+
+@dp.message(MixFlow.choosing_formats)
+async def expect_formats(msg: Message):
+    await msg.answer("Tick the formats with the buttons above, then tap Submit. /cancel drops the mix.")
+
+
 @dp.message()
 async def no_session(msg: Message):
     await msg.answer("Send /mix to start a mix.")
@@ -248,6 +360,7 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     allowed = {int(x) for x in os.environ["ALLOWED_USERS"].split(",") if x.strip()}
     dp.message.filter(F.from_user.id.in_(allowed))  # URLs make the Pi fetch things, so keep strangers out
+    dp.callback_query.filter(F.from_user.id.in_(allowed))
     await dp.start_polling(Bot(os.environ["BOT_TOKEN"]))
 
 
