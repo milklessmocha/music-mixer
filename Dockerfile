@@ -18,7 +18,7 @@ RUN pip install -r /tmp/requirements.txt
 
 RUN useradd --create-home --uid 1000 app
 WORKDIR /app
-COPY --chown=app:app mixer.py bot.py ./
+COPY --chown=app:app mixer.py suggest.py bot.py ./
 
 USER app
 STOPSIGNAL SIGTERM

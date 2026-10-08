@@ -1,5 +1,6 @@
 """Telegram front end: /mix -> audio -> time period -> ... -> /done -> name -> formats -> files.
-/download is a one-track /mix of the whole track: link -> name -> formats -> files."""
+/download is a one-track /mix of the whole track: link -> name -> formats -> files.
+/suggest takes two tracks, lists ranked transitions, and a tapped one continues as /mix: name -> formats."""
 import asyncio
 import contextlib
 import json
@@ -21,6 +22,7 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, Inl
                            Message, ReplyKeyboardMarkup)
 
 import mixer
+import suggest
 
 MIN_SEC, MAX_SEC = 6, 600
 MIN_FADE = 3
@@ -37,7 +39,8 @@ PERIOD_HELP = ("Send the part to use as  beginning - end  or  beginning - end - 
 
 # always-visible command buttons under the input field; colours show on recent Telegram apps
 DECK = ReplyKeyboardMarkup(is_persistent=True, resize_keyboard=True, keyboard=[
-    [KeyboardButton(text="/mix", style="primary"), KeyboardButton(text="/download", style="primary")],
+    [KeyboardButton(text="/mix", style="primary"), KeyboardButton(text="/download", style="primary"),
+     KeyboardButton(text="/suggest", style="primary")],
     [KeyboardButton(text="/done", style="success"), KeyboardButton(text="/cancel", style="danger")],
 ])
 
@@ -51,6 +54,7 @@ class MixFlow(StatesGroup):
     waiting_period = State()
     waiting_name = State()
     choosing_formats = State()
+    choosing_suggestion = State()
 
 
 def fmt(sec):
@@ -187,6 +191,7 @@ async def cmd_start(msg: Message):
     await msg.answer("Send /mix to start a mix. Then send audios or links one by one (6 s to 10 min each), "
                      "give each a time period, and send /done to render.\n"
                      "Send /download to get one whole track from a link in the format you pick.\n"
+                     "Send /suggest with two tracks to get a ranked list of ways to mix them.\n"
                      "/cancel drops the session.", reply_markup=DECK)
 
 
@@ -207,6 +212,14 @@ async def cmd_download(msg: Message, state: FSMContext):
     await msg.answer("Send the link (6 s to 10 min).", reply_markup=DECK)
 
 
+@dp.message(Command("suggest"))
+async def cmd_suggest(msg: Message, state: FSMContext):
+    await drop_session(state)
+    await state.set_state(MixFlow.waiting_audio)
+    await state.update_data(dir=tempfile.mkdtemp(prefix="mix-"), tracks=[], pending=None, suggest=True)
+    await msg.answer("Send the first audio file or link (6 s to 10 min).", reply_markup=DECK)
+
+
 @dp.message(Command("cancel"))
 async def cmd_cancel(msg: Message, state: FSMContext):
     await drop_session(state)
@@ -215,7 +228,10 @@ async def cmd_cancel(msg: Message, state: FSMContext):
 
 @dp.message(Command("done"), MixFlow.waiting_audio)
 async def cmd_done(msg: Message, state: FSMContext):
-    if not (await state.get_data())["tracks"]:
+    data = await state.get_data()
+    if data.get("suggest"):
+        return await msg.answer("/suggest needs two tracks. Send the next audio file or link.")
+    if not data["tracks"]:
         return await msg.answer("Send at least one audio first.")
     await state.set_state(MixFlow.waiting_name)
     await msg.answer("Send a name for the mix, without extension.")
@@ -294,7 +310,14 @@ async def accept_audio(msg, state, path):
     if not MIN_SEC <= duration <= MAX_SEC:
         path.unlink(missing_ok=True)
         return await msg.answer(f"That audio is {fmt(duration)}. It must be between 00:06 and 10:00. Send another one.")
-    if (await state.get_data()).get("single"):  # /download: whole track, straight to naming
+    data = await state.get_data()
+    if data.get("suggest"):  # /suggest: whole tracks, analyze once there are two
+        tracks = data["tracks"] + [{"path": str(path), "duration": duration}]
+        await state.update_data(tracks=tracks)
+        if len(tracks) == 1:
+            return await msg.answer(f"Got track 1, length {fmt(duration)}. Send the second audio file or link.")
+        return await show_suggestions(msg, state, tracks)
+    if data.get("single"):  # /download: whole track, straight to naming
         track = {"path": str(path), "duration": duration, "begin": 0, "end": duration, "fade": None}
         await state.update_data(tracks=[track])
         await state.set_state(MixFlow.waiting_name)
@@ -302,6 +325,55 @@ async def accept_audio(msg, state, path):
     await state.update_data(pending={"path": str(path), "duration": duration})
     await state.set_state(MixFlow.waiting_period)
     await msg.answer(f"Got it, length {fmt(duration)}.\n{PERIOD_HELP}")
+
+
+async def show_suggestions(msg, state, tracks):
+    await state.set_state(MixFlow.choosing_suggestion)  # a third audio sent mid-analysis isn't taken as a track
+    status = await msg.answer("Waiting for another job to finish..." if render_lock.locked() else "Analyzing...")
+    loop = asyncio.get_running_loop()
+    progress = lambda text: asyncio.run_coroutine_threadsafe(edit(status, text), loop)
+    a, b = tracks
+    try:
+        async with render_lock:
+            found = await asyncio.to_thread(suggest.suggest, a["path"], a["duration"], b["path"], b["duration"],
+                                            progress)
+    except Exception as e:
+        logging.exception("suggest failed")
+        await drop_session(state)
+        return await edit(status, f"Couldn't analyze those tracks: {e}\nSend /suggest to try again.")
+    if not found:
+        await drop_session(state)
+        return await edit(status, "No transition fits these two tracks: they are too short for an 8-bar fade. "
+                                  "Use /mix to set the times yourself.")
+    await state.update_data(suggestions=found)
+    lines = [f"{i}. {s['score']}/100   Track 1: {s['a']}   |   Track 2: {s['b']}\n{s['why']}"
+             for i, s in enumerate(found, 1)]
+    buttons = [InlineKeyboardButton(text=str(i), callback_data=f"sug:{i - 1}") for i in range(1, len(found) + 1)]
+    await status.delete()
+    await msg.answer("Ways to mix these two, best first. Tap a number to mix it:\n\n" + "\n\n".join(lines),
+                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[buttons]))
+
+
+@dp.callback_query(MixFlow.choosing_suggestion, F.data.startswith("sug:"))
+async def got_suggestion(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    i = int(cb.data[4:])
+    pick, (a, b) = data["suggestions"][i], data["tracks"]
+    # exact times, not the rounded ones shown, so the overlap stays on the phrase boundaries
+    tracks = [{**a, "begin": 0, "end": pick["end"], "fade": pick["fade"]},
+              {**b, "begin": pick["begin"], "end": b["duration"], "fade": None}]
+    await state.update_data(tracks=tracks)
+    await state.set_state(MixFlow.waiting_name)
+    await cb.answer()
+    with contextlib.suppress(TelegramBadRequest):
+        await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.message.answer(f"Picked {i + 1}: Track 1: {pick['a']}  |  Track 2: {pick['b']}\n"
+                            "Send a name for the mix, without extension.")
+
+
+@dp.callback_query(F.data.startswith("sug:"))
+async def stale_suggestion(cb: CallbackQuery):
+    await cb.answer("This list has expired. Send /suggest to start again.", show_alert=True)
 
 
 @dp.message(MixFlow.waiting_period, F.text)
@@ -400,6 +472,11 @@ async def expect_name(msg: Message):
 @dp.message(MixFlow.choosing_formats)
 async def expect_formats(msg: Message):
     await msg.answer("Tick the formats with the buttons above, then tap Submit. /cancel drops the mix.")
+
+
+@dp.message(MixFlow.choosing_suggestion)
+async def expect_suggestion(msg: Message):
+    await msg.answer("Tap a number under the list to mix it, or /cancel.")
 
 
 @dp.message()

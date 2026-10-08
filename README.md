@@ -45,6 +45,8 @@ set -a && source .env && set +a && .venv/bin/python bot.py
 
 `/download` does the same for a single whole track: send a link, a name, then pick formats. The result is identical to `/mix` with that link, `start - end` and `/done`.
 
+`/suggest` takes two tracks (files or links) and replies with the 5 best ways to mix them, each written as `/mix` input, e.g. `Track 1: start - 03:12 - 00:30 | Track 2: start - end`. Tap a number to mix that one (name, then formats), or copy the lines into `/mix` yourself.
+
 The mix and all downloaded files are deleted once the mix is sent.
 
 ## How a transition works (`mixer.py`)
@@ -55,6 +57,15 @@ The mix and all downloaded files are deleted once the mix is sent.
 - During the overlap, mids/highs crossfade with an equal-power curve while the bass (below 200 Hz) swaps over one beat at the midpoint, so two kick drums never play at once.
 
 Tuning knobs are at the top of `mixer.py`.
+
+## How suggestions are picked (`suggest.py`)
+
+No trained model, only measurements, so it runs on the Pi in seconds:
+
+- Beat grid and bars (the downbeat is the beat where the low end hits hardest), phrases every 8 bars lined up with the biggest section change.
+- Section changes from a self-similarity matrix of per-bar chroma and timbre.
+- Key from chroma against the Krumhansl profiles, shown as a Camelot code (8A, 9B, ...).
+- Every phrase start in track 1 × every phrase start in track 2 × fades of 8, 16 and 32 bars is scored: section changes at both cut points (30), leaving in a quieter part and entering on a quieter intro before a louder part (25), compatible keys (25), close tempos (15), keeping most of both songs (5).
 
 ## Limits
 

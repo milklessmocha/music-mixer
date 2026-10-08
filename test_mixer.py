@@ -11,6 +11,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import bot
 import mixer
+import suggest
 from bot import default_fade, formats_keyboard, parse_name, parse_period, probe_duration
 
 
@@ -212,4 +213,83 @@ async def download_flow():
 
 
 asyncio.run(download_flow())
+# /suggest: keys, ranking on songs with a known structure, valid copy-paste output, bot flow
+def tones(*freqs):
+    chroma = np.zeros(12)
+    for f in freqs:
+        chroma[int(round(12 * np.log2(f / 440) + 9)) % 12] += 1
+    return chroma
+
+
+C_MAJOR, A_MINOR, FS_MAJOR = (261.6, 329.6, 392.0), (220.0, 261.6, 329.6), (370.0, 466.2, 554.4)
+assert [suggest.camelot(tones(*c)) for c in (C_MAJOR, A_MINOR, FS_MAJOR)] == ["8B", "8A", "2B"]
+assert suggest.key_match("8B", "8A") == suggest.key_match("8A", "9A") == 1.0
+assert suggest.key_match("8A", "10A") == 0.5 and suggest.key_match("8B", "2B") == 0.0
+assert suggest.key_match("12B", "1B") == 1.0  # the wheel wraps
+
+
+def song(path, bpm, sections, chord):
+    """sections: (bars, loud). Loud: kick on every beat (accent on 1), bass and chord. Quiet: soft chord only."""
+    beat = 60 / bpm
+    t = np.arange(int(sum(n for n, _ in sections) * 4 * beat * SR)) / SR
+    y, bar = np.zeros_like(t), 0
+    for n_bars, loud in sections:
+        lo, hi = int(bar * 4 * beat * SR), int((bar + n_bars) * 4 * beat * SR)
+        y[lo:hi] += (0.3 if loud else 0.08) * sum(np.sin(2 * np.pi * f * t[lo:hi]) for f in chord) / len(chord)
+        if loud:
+            y[lo:hi] += 0.2 * np.sin(2 * np.pi * chord[0] / 4 * t[lo:hi])
+            for k in range(n_bars * 4):
+                i = lo + int(k * beat * SR)
+                n = min(4000, len(y) - i)
+                y[i:i + n] += (1.0 if k % 4 == 0 else 0.6) * np.sin(2 * np.pi * 55 * np.arange(n) / SR) * np.exp(-np.arange(n) / 800)
+        bar += n_bars
+    y += np.random.default_rng(0).normal(0, 0.003, y.size)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ar", str(SR), "-ac", "1", "-i", "-", str(path)],
+                   input=y.astype(np.float32).tobytes(), check=True)
+    return len(t) / SR
+
+
+class FakeCallback:
+    def __init__(self, data, message):
+        self.data, self.message = data, message
+
+    async def answer(self, *_, **__):
+        pass
+
+
+async def suggest_flow():
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        dur_a = song(d / "a.wav", 124, [(48, True), (16, False)], C_MAJOR)  # loud, then a 16-bar outro
+        dur_b = song(d / "b.wav", 126, [(16, False), (48, True)], A_MINOR)  # 16-bar intro, then loud
+        state = FSMContext(MemoryStorage(), StorageKey(bot_id=1, chat_id=1, user_id=1))
+        await state.set_state(bot.MixFlow.waiting_audio)
+        await state.set_data({"dir": str(d), "tracks": [], "pending": None, "suggest": True})
+        chat = FakeChat()
+        chat.delete = lambda: asyncio.sleep(0)
+        chat.edit_reply_markup = lambda **_: asyncio.sleep(0)
+        await bot.accept_audio(chat, state, d / "a.wav")
+        assert await state.get_state() == bot.MixFlow.waiting_audio and "second" in chat.texts[-1]
+        await bot.accept_audio(chat, state, d / "b.wav")
+        assert await state.get_state() == bot.MixFlow.choosing_suggestion
+
+        found = (await state.get_data())["suggestions"]
+        assert 1 <= len(found) <= suggest.TOP
+        assert [s["score"] for s in found] == sorted((s["score"] for s in found), reverse=True)
+        best = found[0]
+        outro = 48 * 4 * 60 / 124
+        assert best["end"] - best["fade"] > outro - 1 and best["begin"] == 0, best  # leave in the outro, enter at the top
+        for s in found:  # what's shown is valid /mix input
+            parse_period(s["a"], dur_a)
+            parse_period(s["b"], dur_b)
+        assert len(chat.markups[-1].inline_keyboard[0]) == len(found)
+
+        await bot.got_suggestion(FakeCallback("sug:0", chat), state)
+        a, b = (await state.get_data())["tracks"]
+        assert (a["begin"], a["end"], a["fade"]) == (0, best["end"], best["fade"])
+        assert (b["begin"], b["end"], b["fade"]) == (best["begin"], b["duration"], None)
+        assert await state.get_state() == bot.MixFlow.waiting_name
+
+
+asyncio.run(suggest_flow())
 print("ok")
