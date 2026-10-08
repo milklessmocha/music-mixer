@@ -321,4 +321,38 @@ async def analyze_flow():
 
 
 asyncio.run(analyze_flow())
+# deck: buttons show readable labels, and pressing one (which sends the label) runs the command
+assert bot.label("/done") == "Done" and bot.label("/three-word-command") == "Three word command"
+assert [[b.text for b in row] for row in bot.DECK.keyboard] == [["Mix", "Download", "Suggest", "Analyze"],
+                                                                 ["Done", "Cancel"]]
+
+
+async def deck_press():
+    from aiogram import Bot
+    from aiogram.client.session.base import BaseSession
+    from aiogram.types import Chat, Message, Update, User
+
+    class OfflineSession(BaseSession):  # answers every API call locally, nothing reaches Telegram
+        async def make_request(self, bot, method, timeout=None):
+            return Message(message_id=1, date=0, chat=Chat(id=1, type="private"), text="x")
+
+        async def stream_content(self, *a, **k):
+            yield b""
+
+        async def close(self):
+            pass
+
+    tg = Bot("1:x", session=OfflineSession())
+    me = User(id=7, is_bot=False, first_name="me")
+    state = bot.dp.fsm.get_context(tg, chat_id=7, user_id=7)
+    for text, expected in [("Mix", bot.MixFlow.waiting_audio), ("Cancel", None), ("/mix", bot.MixFlow.waiting_audio)]:
+        msg = Message(message_id=1, date=0, chat=Chat(id=7, type="private"), from_user=me, text=text)
+        await bot.dp.feed_update(tg, Update(update_id=1, message=msg))
+        assert await state.get_state() == expected, (text, await state.get_state())
+    await bot.drop_session(state)
+    for task in bot.timers.values():
+        task.cancel()
+
+
+asyncio.run(deck_press())
 print("ok")

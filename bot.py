@@ -16,7 +16,7 @@ from pathlib import Path
 import yt_dlp
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.filters import Command, or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
@@ -39,11 +39,25 @@ PERIOD_HELP = ("Send the part to use as  beginning - end  or  beginning - end - 
                "Examples:  start - end    0:54 - 2:13    1:00 - end - 0:08\n"
                "Fade is optional, at least 00:03, and must fit twice into the part.")
 
+def label(command):
+    """Deck button text for a command: '/done' -> 'Done', '/three-word-command' -> 'Three word command'."""
+    return command.lstrip("/").replace("-", " ").replace("_", " ").capitalize()
+
+
+def cmd(*names):
+    """Matches a typed /command or the deck button for it (a button sends its own text, e.g. 'Done')."""
+    return or_f(Command(*names), F.text.in_({label(n) for n in names}))
+
+
+def deck_button(command, style):
+    return KeyboardButton(text=label(command), style=style)
+
+
 # always-visible command buttons under the input field; colours show on recent Telegram apps
 DECK = ReplyKeyboardMarkup(is_persistent=True, resize_keyboard=True, keyboard=[
-    [KeyboardButton(text="/mix", style="primary"), KeyboardButton(text="/download", style="primary"),
-     KeyboardButton(text="/suggest", style="primary"), KeyboardButton(text="/analyze", style="primary")],
-    [KeyboardButton(text="/done", style="success"), KeyboardButton(text="/cancel", style="danger")],
+    [deck_button("/mix", "primary"), deck_button("/download", "primary"),
+     deck_button("/suggest", "primary"), deck_button("/analyze", "primary")],
+    [deck_button("/done", "success"), deck_button("/cancel", "danger")],
 ])
 
 dp = Dispatcher()
@@ -198,7 +212,7 @@ async def cmd_start(msg: Message):
                      "/cancel drops the session.", reply_markup=DECK)
 
 
-@dp.message(Command("mix"))
+@dp.message(cmd("mix"))
 async def cmd_mix(msg: Message, state: FSMContext):
     await drop_session(state)
     await state.set_state(MixFlow.waiting_audio)
@@ -206,7 +220,7 @@ async def cmd_mix(msg: Message, state: FSMContext):
     await msg.answer("Send the first audio file or link (6 s to 10 min).", reply_markup=DECK)
 
 
-@dp.message(Command("download"))
+@dp.message(cmd("download"))
 async def cmd_download(msg: Message, state: FSMContext):
     """Same as /mix with one link, period 'start - end', then /done."""
     await drop_session(state)
@@ -215,7 +229,7 @@ async def cmd_download(msg: Message, state: FSMContext):
     await msg.answer("Send the link (6 s to 10 min).", reply_markup=DECK)
 
 
-@dp.message(Command("suggest"))
+@dp.message(cmd("suggest"))
 async def cmd_suggest(msg: Message, state: FSMContext):
     await drop_session(state)
     await state.set_state(MixFlow.waiting_audio)
@@ -223,7 +237,7 @@ async def cmd_suggest(msg: Message, state: FSMContext):
     await msg.answer("Send the first audio file or link (6 s to 10 min).", reply_markup=DECK)
 
 
-@dp.message(Command("analyze"))
+@dp.message(cmd("analyze"))
 async def cmd_analyze(msg: Message, state: FSMContext):
     await drop_session(state)
     await state.set_state(MixFlow.waiting_audio)
@@ -232,13 +246,13 @@ async def cmd_analyze(msg: Message, state: FSMContext):
                      reply_markup=DECK)
 
 
-@dp.message(Command("cancel"))
+@dp.message(cmd("cancel"))
 async def cmd_cancel(msg: Message, state: FSMContext):
     await drop_session(state)
     await msg.answer("Cancelled. Send /mix to start again.", reply_markup=DECK)
 
 
-@dp.message(Command("done"), MixFlow.waiting_audio)
+@dp.message(cmd("done"), MixFlow.waiting_audio)
 async def cmd_done(msg: Message, state: FSMContext):
     data = await state.get_data()
     if data.get("suggest"):
