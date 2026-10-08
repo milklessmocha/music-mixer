@@ -47,6 +47,8 @@ set -a && source .env && set +a && .venv/bin/python bot.py
 
 `/suggest` takes two tracks (files or links) and replies with the 5 best ways to mix them, each written as `/mix` input, e.g. `Track 1: start - 03:12 - 00:30 | Track 2: start - end`. Tap a number to mix that one (name, then formats), or copy the lines into `/mix` yourself.
 
+`/analyze` takes 2 to 8 tracks, then `/done`. It lists each track's length, BPM, Camelot key and whether it has a quiet intro or outro, then tries every order and shows the one where neighbours fit best (keys 40, tempo 40, quiet outro into quiet intro 20), with a score per pair. Use `/suggest` on a pair from that order for exact mix points.
+
 The mix and all downloaded files are deleted once the mix is sent.
 
 ## How a transition works (`mixer.py`)

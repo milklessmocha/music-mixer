@@ -1,5 +1,7 @@
-"""Transition suggestions for two tracks: where to leave track 1, where to enter track 2, how long to fade.
-Pure measurement (beat grid, phrases, energy, key, tempo), no trained model, so it runs on a Pi."""
+"""Transition suggestions for two tracks (where to leave track 1, where to enter track 2, how long to fade) and
+an overview of several tracks with the order that mixes best. Pure measurement (beat grid, phrases, energy,
+key, tempo), no trained model, so it runs on a Pi."""
+import itertools
 import math
 
 import numpy as np
@@ -167,3 +169,52 @@ def suggest(path_a, duration_a, path_b, duration_b, progress=print):
     b = profile(path_b, duration_b)
     progress("Scoring transitions...")
     return rank(a, b)
+
+
+def edges(p):
+    """How loud the first and last 8 bars are next to the track's median: below ~0.75 is a quiet intro/outro."""
+    e, med = p["energy"], np.median(p["energy"]) + 1e-9
+    return e[:8].mean() / med, e[-8:].mean() / med
+
+
+def pair(a, b):
+    """How well b follows a, 0-100: key 40, tempo 40, a quiet outro into a quiet intro 20."""
+    n = mixer.match_octave(b["bpm"], a["bpm"])
+    tempo = max(0.0, 1 - abs(math.log(a["bpm"] / n)) / math.log(1 + TEMPO_LIMIT))
+    quiet = (np.clip(1.5 - edges(a)[1], 0, 1) + np.clip(1.5 - edges(b)[0], 0, 1)) / 2
+    return 40 * key_match(a["key"], b["key"]) + 40 * tempo + 20 * quiet
+
+
+def best_order(profiles):
+    """Order with the best total pair score. Brute force, fine for the 8 tracks the bot allows (40320 orders)."""
+    n = len(profiles)
+    score = [[pair(a, b) for b in profiles] for a in profiles]
+    return max(itertools.permutations(range(n)), key=lambda o: sum(score[i][j] for i, j in zip(o, o[1:])))
+
+
+def overview(paths, durations, names, progress=print):
+    """Text report: one line per track, then the recommended order with how each neighbour pair fits."""
+    profiles = []
+    for i, (path, duration) in enumerate(zip(paths, durations), 1):
+        progress(f"Analyzing track {i}/{len(paths)}...")
+        profiles.append(profile(path, duration))
+
+    lines = []
+    for i, (p, name) in enumerate(zip(profiles, names), 1):
+        intro, outro = edges(p)
+        shape = ", ".join(x for x in ("quiet intro" if intro < 0.75 else "", "quiet outro" if outro < 0.75 else "") if x)
+        lines.append(f"{i}. {name[:60]}\n   {clock(p['duration'])}, {p['bpm']:.0f} BPM, key {p['key']}"
+                     + (f", {shape}" if shape else ""))
+    if len(profiles) < 2:
+        return "\n".join(lines)
+
+    order = best_order(profiles)
+    lines.append("\nBest order: " + " -> ".join(str(i + 1) for i in order))
+    for i, j in zip(order, order[1:]):
+        a, b = profiles[i], profiles[j]
+        n = mixer.match_octave(b["bpm"], a["bpm"])
+        keys = {1.0: "keys match", 0.5: "keys close", 0.0: "keys clash"}[key_match(a["key"], b["key"])]
+        lines.append(f"   {i + 1} -> {j + 1}: {pair(a, b):.0f}/100, {a['key']} -> {b['key']} {keys}, "
+                     f"{a['bpm']:.0f} -> {n:.0f} BPM ({(n / a['bpm'] - 1) * 100:+.1f}%)")
+    lines.append("\nUse /suggest on a pair for exact mix points.")
+    return "\n".join(lines)

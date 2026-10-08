@@ -1,6 +1,7 @@
 """Telegram front end: /mix -> audio -> time period -> ... -> /done -> name -> formats -> files.
 /download is a one-track /mix of the whole track: link -> name -> formats -> files.
-/suggest takes two tracks, lists ranked transitions, and a tapped one continues as /mix: name -> formats."""
+/suggest takes two tracks, lists ranked transitions, and a tapped one continues as /mix: name -> formats.
+/analyze takes 2-8 tracks and reports tempo, key and intro/outro of each, plus the order that mixes best."""
 import asyncio
 import contextlib
 import json
@@ -30,6 +31,7 @@ TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # Bot API getFile cap
 URL_DOWNLOAD_LIMIT = 100 * 1024 * 1024
 TG_UPLOAD_LIMIT = 50 * 1024 * 1024  # Bot API sendDocument/sendAudio cap
 SESSION_TIMEOUT = 600  # seconds without any action before a /mix session and its files are dropped
+MAX_ANALYZE = 8  # tracks per /analyze; every order is tried, 8! = 40320
 PLAYABLE = {"mp3", "m4a"}  # Telegram's audio player takes these; the rest go out as files
 
 PERIOD_HELP = ("Send the part to use as  beginning - end  or  beginning - end - fade\n"
@@ -40,7 +42,7 @@ PERIOD_HELP = ("Send the part to use as  beginning - end  or  beginning - end - 
 # always-visible command buttons under the input field; colours show on recent Telegram apps
 DECK = ReplyKeyboardMarkup(is_persistent=True, resize_keyboard=True, keyboard=[
     [KeyboardButton(text="/mix", style="primary"), KeyboardButton(text="/download", style="primary"),
-     KeyboardButton(text="/suggest", style="primary")],
+     KeyboardButton(text="/suggest", style="primary"), KeyboardButton(text="/analyze", style="primary")],
     [KeyboardButton(text="/done", style="success"), KeyboardButton(text="/cancel", style="danger")],
 ])
 
@@ -146,7 +148,7 @@ def fetch_url(url, folder, idx):
     files = list(folder.glob(f"{idx}-url.*"))
     if not files:
         raise ValueError("Download produced no file (too large?).")
-    return files[0]
+    return files[0], info.get("title")
 
 
 async def edit(msg, text):
@@ -192,6 +194,7 @@ async def cmd_start(msg: Message):
                      "give each a time period, and send /done to render.\n"
                      "Send /download to get one whole track from a link in the format you pick.\n"
                      "Send /suggest with two tracks to get a ranked list of ways to mix them.\n"
+                     "Send /analyze with up to 8 tracks to see their tempo and key and the best order to mix them.\n"
                      "/cancel drops the session.", reply_markup=DECK)
 
 
@@ -220,6 +223,15 @@ async def cmd_suggest(msg: Message, state: FSMContext):
     await msg.answer("Send the first audio file or link (6 s to 10 min).", reply_markup=DECK)
 
 
+@dp.message(Command("analyze"))
+async def cmd_analyze(msg: Message, state: FSMContext):
+    await drop_session(state)
+    await state.set_state(MixFlow.waiting_audio)
+    await state.update_data(dir=tempfile.mkdtemp(prefix="mix-"), tracks=[], pending=None, analyze=True)
+    await msg.answer(f"Send the audio files or links to compare, one by one (up to {MAX_ANALYZE}), then /done.",
+                     reply_markup=DECK)
+
+
 @dp.message(Command("cancel"))
 async def cmd_cancel(msg: Message, state: FSMContext):
     await drop_session(state)
@@ -231,6 +243,10 @@ async def cmd_done(msg: Message, state: FSMContext):
     data = await state.get_data()
     if data.get("suggest"):
         return await msg.answer("/suggest needs two tracks. Send the next audio file or link.")
+    if data.get("analyze"):
+        if not data["tracks"]:
+            return await msg.answer("Send at least one audio first.")
+        return await show_overview(msg, state, data["tracks"])
     if not data["tracks"]:
         return await msg.answer("Send at least one audio first.")
     await state.set_state(MixFlow.waiting_name)
@@ -286,7 +302,7 @@ async def got_file(msg: Message, state: FSMContext, bot: Bot):
     path = Path(data["dir"]) / f"{len(data['tracks'])}-{media.file_unique_id}"
     # ponytail: a second audio sent mid-download replaces the pending one; add a "downloading" state if that bites
     await bot.download(media, destination=path, timeout=300)
-    await accept_audio(msg, state, path)
+    await accept_audio(msg, state, path, getattr(media, "title", None) or getattr(media, "file_name", None))
 
 
 @dp.message(MixFlow.waiting_audio, F.text.regexp(r"^\s*https?://\S+\s*$"))
@@ -294,14 +310,14 @@ async def got_url(msg: Message, state: FSMContext):
     data = await state.get_data()
     status = await msg.answer("Downloading...")
     try:
-        path = await asyncio.to_thread(fetch_url, msg.text.strip(), Path(data["dir"]), len(data["tracks"]))
+        path, title = await asyncio.to_thread(fetch_url, msg.text.strip(), Path(data["dir"]), len(data["tracks"]))
     except Exception as e:
         return await edit(status, f"Couldn't download that: {e}\nSend another file or link.")
     await status.delete()
-    await accept_audio(msg, state, path)
+    await accept_audio(msg, state, path, title)
 
 
-async def accept_audio(msg, state, path):
+async def accept_audio(msg, state, path, title=None):
     try:
         duration = probe_duration(path)
     except (ValueError, KeyError) as e:
@@ -311,6 +327,14 @@ async def accept_audio(msg, state, path):
         path.unlink(missing_ok=True)
         return await msg.answer(f"That audio is {fmt(duration)}. It must be between 00:06 and 10:00. Send another one.")
     data = await state.get_data()
+    if data.get("analyze"):  # /analyze: whole tracks, report on /done or at the limit
+        tracks = data["tracks"] + [{"path": str(path), "duration": duration,
+                                    "name": title or f"Track {len(data['tracks']) + 1}"}]
+        await state.update_data(tracks=tracks)
+        if len(tracks) == MAX_ANALYZE:
+            return await show_overview(msg, state, tracks)
+        return await msg.answer(f"Got track {len(tracks)}, length {fmt(duration)}. "
+                                f"Send another (up to {MAX_ANALYZE}), or /done to analyze.")
     if data.get("suggest"):  # /suggest: whole tracks, analyze once there are two
         tracks = data["tracks"] + [{"path": str(path), "duration": duration}]
         await state.update_data(tracks=tracks)
@@ -325,6 +349,24 @@ async def accept_audio(msg, state, path):
     await state.update_data(pending={"path": str(path), "duration": duration})
     await state.set_state(MixFlow.waiting_period)
     await msg.answer(f"Got it, length {fmt(duration)}.\n{PERIOD_HELP}")
+
+
+async def show_overview(msg, state, tracks):
+    await state.set_state(MixFlow.choosing_suggestion)  # ignore further audio while analyzing
+    status = await msg.answer("Waiting for another job to finish..." if render_lock.locked() else "Analyzing...")
+    loop = asyncio.get_running_loop()
+    progress = lambda text: asyncio.run_coroutine_threadsafe(edit(status, text), loop)
+    try:
+        async with render_lock:
+            report = await asyncio.to_thread(suggest.overview, [t["path"] for t in tracks],
+                                             [t["duration"] for t in tracks], [t["name"] for t in tracks], progress)
+    except Exception as e:
+        logging.exception("analyze failed")
+        report = f"Couldn't analyze those tracks: {e}\nSend /analyze to try again."
+    finally:
+        await drop_session(state)  # the report is all there is; nothing to keep
+    await status.delete()
+    await msg.answer(report, reply_markup=DECK)
 
 
 async def show_suggestions(msg, state, tracks):
@@ -476,7 +518,8 @@ async def expect_formats(msg: Message):
 
 @dp.message(MixFlow.choosing_suggestion)
 async def expect_suggestion(msg: Message):
-    await msg.answer("Tap a number under the list to mix it, or /cancel.")
+    await msg.answer("Wait for the analysis to finish, then tap a number under the list if there is one. "
+                     "/cancel stops.")
 
 
 @dp.message()

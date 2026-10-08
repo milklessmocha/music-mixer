@@ -292,4 +292,33 @@ async def suggest_flow():
 
 
 asyncio.run(suggest_flow())
+# /analyze: report per track and the best order; a quiet outro into a matching quiet intro goes first
+async def analyze_flow():
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        song(d / "c.wav", 100, [(8, True), (24, True)], FS_MAJOR)  # clashes in key and tempo with both
+        song(d / "a.wav", 124, [(24, True), (8, False)], C_MAJOR)  # quiet outro
+        song(d / "b.wav", 126, [(8, False), (24, True)], A_MINOR)  # quiet intro, relative key of a
+        names = ["c", "a", "b"]
+        profiles = [suggest.profile(d / f"{n}.wav", probe_duration(d / f"{n}.wav")) for n in names]
+        order = suggest.best_order(profiles)
+        assert "1 2" in " ".join(map(str, order)), order  # a (index 1) right before b (index 2)
+        assert suggest.pair(profiles[1], profiles[2]) > suggest.pair(profiles[2], profiles[1])
+
+        state = FSMContext(MemoryStorage(), StorageKey(bot_id=1, chat_id=1, user_id=1))
+        await state.set_state(bot.MixFlow.waiting_audio)
+        await state.set_data({"dir": str(d), "tracks": [], "pending": None, "analyze": True})
+        chat = FakeChat()
+        chat.delete = lambda: asyncio.sleep(0)
+        for n in names:
+            await bot.accept_audio(chat, state, d / f"{n}.wav", f"song {n}")
+        assert "/done" in chat.texts[-1] and len((await state.get_data())["tracks"]) == 3
+        await bot.cmd_done(chat, state)
+        report = chat.texts[-1]
+        assert "song a" in report and "8B" in report and "Best order:" in report, report
+        assert "2 -> 3" in report  # a -> b, numbered as sent
+        assert await state.get_state() is None and not d.exists()  # session and its downloads are gone
+
+
+asyncio.run(analyze_flow())
 print("ok")
