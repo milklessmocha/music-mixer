@@ -17,7 +17,8 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+                           Message, ReplyKeyboardMarkup)
 
 import mixer
 
@@ -33,6 +34,12 @@ PERIOD_HELP = ("Send the part to use as  beginning - end  or  beginning - end - 
                "Times are mm:ss (1:2 and 01:02 both work). Use start / end for the track edges.\n"
                "Examples:  start - end    0:54 - 2:13    1:00 - end - 0:08\n"
                "Fade is optional, at least 00:03, and must fit twice into the part.")
+
+# always-visible command buttons under the input field; colours show on recent Telegram apps
+DECK = ReplyKeyboardMarkup(is_persistent=True, resize_keyboard=True, keyboard=[
+    [KeyboardButton(text="/mix", style="primary"), KeyboardButton(text="/download", style="primary")],
+    [KeyboardButton(text="/done", style="success"), KeyboardButton(text="/cancel", style="danger")],
+])
 
 dp = Dispatcher()
 render_lock = asyncio.Lock()  # ponytail: one render at a time keeps the Pi responsive; a real queue if users pile up
@@ -102,7 +109,7 @@ def formats_keyboard(selected, available=tuple(mixer.FORMATS)):
     formats = [button(ext in selected, ext, ext) for ext in available]
     rows = [formats[i:i + 3] for i in range(0, len(formats), 3)]
     rows.append([button(set(selected) == set(available), "All extensions", "all")])
-    rows.append([InlineKeyboardButton(text="Submit", callback_data="fmt:go")])
+    rows.append([InlineKeyboardButton(text="Submit", callback_data="fmt:go", style="success")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -154,7 +161,7 @@ async def expire(state, bot, chat_id):
     await asyncio.sleep(SESSION_TIMEOUT)
     await drop_session(state)
     await bot.send_message(chat_id, "The mix session expired after 10 minutes without activity and its files "
-                                    "were deleted. Send /mix to start again.")
+                                    "were deleted. Send /mix to start again.", reply_markup=DECK)
 
 
 async def session_timer(handler, event, data):
@@ -180,7 +187,7 @@ async def cmd_start(msg: Message):
     await msg.answer("Send /mix to start a mix. Then send audios or links one by one (6 s to 10 min each), "
                      "give each a time period, and send /done to render.\n"
                      "Send /download to get one whole track from a link in the format you pick.\n"
-                     "/cancel drops the session.")
+                     "/cancel drops the session.", reply_markup=DECK)
 
 
 @dp.message(Command("mix"))
@@ -188,7 +195,7 @@ async def cmd_mix(msg: Message, state: FSMContext):
     await drop_session(state)
     await state.set_state(MixFlow.waiting_audio)
     await state.update_data(dir=tempfile.mkdtemp(prefix="mix-"), tracks=[], pending=None)
-    await msg.answer("Send the first audio file or link (6 s to 10 min).")
+    await msg.answer("Send the first audio file or link (6 s to 10 min).", reply_markup=DECK)
 
 
 @dp.message(Command("download"))
@@ -197,13 +204,13 @@ async def cmd_download(msg: Message, state: FSMContext):
     await drop_session(state)
     await state.set_state(MixFlow.waiting_audio)
     await state.update_data(dir=tempfile.mkdtemp(prefix="mix-"), tracks=[], pending=None, single=True)
-    await msg.answer("Send the link (6 s to 10 min).")
+    await msg.answer("Send the link (6 s to 10 min).", reply_markup=DECK)
 
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(msg: Message, state: FSMContext):
     await drop_session(state)
-    await msg.answer("Cancelled. Send /mix to start again.")
+    await msg.answer("Cancelled. Send /mix to start again.", reply_markup=DECK)
 
 
 @dp.message(Command("done"), MixFlow.waiting_audio)
@@ -397,7 +404,7 @@ async def expect_formats(msg: Message):
 
 @dp.message()
 async def no_session(msg: Message):
-    await msg.answer("Send /mix to start a mix.")
+    await msg.answer("Send /mix to start a mix.", reply_markup=DECK)
 
 
 async def main():

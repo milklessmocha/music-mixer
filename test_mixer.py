@@ -175,7 +175,7 @@ async def idle_timeout():
         session.mkdir()
         state = FSMContext(MemoryStorage(), StorageKey(bot_id=1, chat_id=1, user_id=1))
         chat = FakeChat()
-        chat.send_message = lambda chat_id, text: chat.answer(text)
+        chat.send_message = lambda chat_id, text, **kw: chat.answer(text, **kw)
         data = {"event_chat": chat.chat, "event_from_user": chat.chat, "state": state, "bot": chat}
 
         async def start_mix(event, data):
@@ -191,6 +191,7 @@ async def idle_timeout():
         await asyncio.sleep(0.2)
         assert await state.get_state() is None and not session.exists()
         assert "expired" in chat.texts[-1]
+        assert chat.markups[-1] is bot.DECK  # the command buttons come back with the expiry notice
 
 
 asyncio.run(idle_timeout())
