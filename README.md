@@ -2,7 +2,31 @@
 
 Telegram bot that turns a list of tracks into one DJ-style mix. Built to run on a Raspberry Pi 5.
 
-## Setup
+## Deploy on the Pi
+
+On a Raspberry Pi with 64-bit Raspberry Pi OS:
+
+```bash
+git clone https://github.com/milklessmocha/music-mixer.git
+cd music-mixer
+cp .env.example .env
+nano .env
+./deploy/install.sh
+```
+
+In `.env`, set `BOT_TOKEN` (from @BotFather) and `ALLOWED_USERS` (your id, from @userinfobot). `./deploy/install.sh` installs Docker if it is missing, starts the bot in Docker, and sets up a timer that pulls `main` and rebuilds within 5 minutes of every push. Running it again is safe.
+
+| What | Command on the Pi |
+| --- | --- |
+| Bot logs | `docker compose logs -f` (inside the repo) |
+| Deploy history | `journalctl -u music-mixer-deploy` |
+| Deploy now | `./deploy/deploy.sh --force` |
+| Stop auto-deploy | `sudo systemctl disable --now music-mixer-deploy.timer` |
+| Stop the bot | `docker compose down` |
+
+A deploy that would overwrite changes made by hand on the Pi refuses and shows up as failed in the deploy history.
+
+## Setup by hand
 
 Copy `.env.example` to `.env` next to `docker-compose.yml` and fill it in:
 
