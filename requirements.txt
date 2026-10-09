@@ -1,5 +1,5 @@
 aiogram>=3.13
 scipy
 numpy
-yt-dlp
+yt-dlp[default]  # [default] adds yt-dlp-ejs, the scripts deno runs to solve YouTube's JS challenges
 bgutil-ytdlp-pot-provider
