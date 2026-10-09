@@ -355,4 +355,41 @@ async def deck_press():
 
 
 asyncio.run(deck_press())
+# links: yt-dlp gets a copy of the cookies file when there is one, and nothing when there isn't
+class FakeYDL:
+    seen = []
+
+    def __init__(self, opts):
+        FakeYDL.seen.append(opts)
+        self.opts = opts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+    def extract_info(self, url, download):
+        return {"title": "t", "duration": 60}
+
+    def process_ie_result(self, info, download):
+        Path(self.opts["outtmpl"].replace("%(ext)s", "m4a")).write_bytes(b"x")
+
+
+with tempfile.TemporaryDirectory() as d:
+    d, real = Path(d), bot.yt_dlp.YoutubeDL
+    bot.yt_dlp.YoutubeDL, bot.COOKIES = FakeYDL, d / "youtube.txt"
+    try:
+        assert bot.fetch_url("https://x", d, 0)[1] == "t" and "cookiefile" not in FakeYDL.seen[-1]
+        bot.COOKIES.write_text("# Netscape HTTP Cookie File\n")
+        bot.fetch_url("https://x", d, 1)
+        copy = Path(FakeYDL.seen[-1]["cookiefile"])
+        assert copy != bot.COOKIES and copy.read_text() == bot.COOKIES.read_text()
+        assert "extractor_args" not in FakeYDL.seen[-1]  # no helper configured, as in a local run
+        bot.POT_PROVIDER = "http://pot-provider:4416"
+        bot.fetch_url("https://x", d, 2)
+        assert FakeYDL.seen[-1]["extractor_args"] == {"youtubepot-bgutilhttp": {"base_url": ["http://pot-provider:4416"]}}
+    finally:
+        bot.yt_dlp.YoutubeDL = real
+
 print("ok")

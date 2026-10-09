@@ -1,6 +1,9 @@
 services:
   mixer-bot:
-    build: .
+    build:
+      context: .
+      args:
+        YTDLP_REFRESH: ${YTDLP_REFRESH:-0}
     image: music-mixer:latest
     container_name: music-mixer
     restart: unless-stopped
@@ -8,14 +11,34 @@ services:
 
     env_file:
       - .env
+    environment:
+      POT_PROVIDER_URL: http://pot-provider:4416
+    depends_on:
+      - pot-provider
 
     # Downloads and the rendered mix live in the container's /tmp and are deleted
-    # after each mix, so there is nothing to persist: no volumes.
+    # after each mix. The only mount is optional YouTube cookies (cookies/youtube.txt).
+    volumes:
+      - ./cookies:/cookies:ro
     # The bot talks to Telegram over long polling: no ports to publish.
 
     # A 30 min mix holds ~600 MB of float audio plus working copies.
     mem_limit: 3g
 
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Makes the "proof of origin" tokens YouTube checks; yt-dlp asks it through the bgutil plugin.
+  # Without them YouTube is much quicker to answer "Sign in to confirm you're not a bot".
+  pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider
+    container_name: music-mixer-pot
+    restart: unless-stopped
+    init: true
+    mem_limit: 512m
     logging:
       driver: json-file
       options:

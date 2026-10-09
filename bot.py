@@ -29,6 +29,9 @@ MIN_SEC, MAX_SEC = 6, 600
 MIN_FADE = 3
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # Bot API getFile cap
 URL_DOWNLOAD_LIMIT = 100 * 1024 * 1024
+# Netscape cookies.txt from a logged-in YouTube session, used only if present (see README: YouTube blocks)
+COOKIES = Path(os.environ.get("YTDLP_COOKIES", "/cookies/youtube.txt"))
+POT_PROVIDER = os.environ.get("POT_PROVIDER_URL")  # PO-token helper container, see docker-compose.yml
 TG_UPLOAD_LIMIT = 50 * 1024 * 1024  # Bot API sendDocument/sendAudio cap
 SESSION_TIMEOUT = 600  # seconds without any action before a /mix session and its files are dropped
 MAX_ANALYZE = 8  # tracks per /analyze; every order is tried, 8! = 40320
@@ -152,6 +155,10 @@ def probe_duration(path):
 def fetch_url(url, folder, idx):
     opts = {"format": "bestaudio/best", "noplaylist": True, "quiet": True, "no_warnings": True,
             "outtmpl": str(folder / f"{idx}-url.%(ext)s"), "max_filesize": URL_DOWNLOAD_LIMIT}
+    if POT_PROVIDER:
+        opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER]}}
+    if COOKIES.is_file():  # yt-dlp rewrites its cookie file, so give it a copy and keep the original intact
+        opts["cookiefile"] = shutil.copy(COOKIES, folder / "cookies.txt")
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
         if "entries" in info:
@@ -326,7 +333,9 @@ async def got_url(msg: Message, state: FSMContext):
     try:
         path, title = await asyncio.to_thread(fetch_url, msg.text.strip(), Path(data["dir"]), len(data["tracks"]))
     except Exception as e:
-        return await edit(status, f"Couldn't download that: {e}\nSend another file or link.")
+        hint = ("\nYouTube is blocking this server. Adding YouTube cookies on the server fixes it "
+                "(README: YouTube blocks)." if "confirm you" in str(e) and "not a bot" in str(e) else "")
+        return await edit(status, f"Couldn't download that: {e}{hint}\nSend another file or link.")
     await status.delete()
     await accept_audio(msg, state, path, title)
 

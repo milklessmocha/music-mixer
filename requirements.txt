@@ -2,3 +2,4 @@ aiogram>=3.13
 scipy
 numpy
 yt-dlp
+bgutil-ytdlp-pot-provider

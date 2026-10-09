@@ -26,6 +26,23 @@ In `.env`, set `BOT_TOKEN` (from @BotFather) and `ALLOWED_USERS` (your id, from 
 
 A deploy that would overwrite changes made by hand on the Pi refuses and shows up as failed in the deploy history.
 
+### YouTube blocks ("Sign in to confirm you're not a bot")
+
+YouTube flags some IP addresses and then refuses downloads from them. Three things guard against it:
+
+- Deno in the image, the JavaScript runtime yt-dlp needs to talk to YouTube like a normal client.
+- A second container, `pot-provider` (bgutil), that makes the "proof of origin" tokens YouTube checks; yt-dlp asks it when YouTube wants one.
+- yt-dlp reinstalled once a day by the deploy timer, since YouTube changes often and yt-dlp fixes follow within days.
+
+If it still happens, add a cookies file from a logged-in YouTube session:
+
+1. Use a spare Google account, not your main one: YouTube can lock accounts used this way.
+2. On any computer, open a private/incognito window, log in to YouTube with it, then go to `https://www.youtube.com/robots.txt` in the same tab.
+3. Export the cookies for youtube.com in Netscape format, e.g. with the "Get cookies.txt LOCALLY" browser extension, then close the private window (logging out would invalidate them).
+4. Copy the file to the Pi: `scp cookies.txt <user>@<pi>:~/music-mixer/cookies/youtube.txt`
+
+The bot picks it up on the next link, no restart needed. The file is a login, so keep it private: `cookies/` is git-ignored. If the error comes back weeks later, repeat with fresh cookies.
+
 ## Setup by hand
 
 Copy `.env.example` to `.env` next to `docker-compose.yml` and fill it in:
